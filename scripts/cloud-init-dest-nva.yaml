@@ -1,0 +1,88 @@
+#cloud-config
+# Cloud-init for Linux NVA — VXLAN tunnel termination (simulates Zscaler)
+# Includes nginx with HTTPS for realistic traffic testing.
+# Note: Azure blocks GRE (protocol 47) between VMs. VXLAN (UDP 4789) works.
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - iproute2
+  - tcpdump
+  - traceroute
+  - iperf3
+  - nginx
+  - openssl
+
+write_files:
+  - path: /etc/sysctl.d/99-ip-forward.conf
+    content: |
+      net.ipv4.ip_forward = 1
+      net.ipv4.conf.all.accept_redirects = 0
+      net.ipv4.conf.all.send_redirects = 0
+
+  - path: /etc/nginx/sites-available/default
+    content: |
+      server {
+          listen 80 default_server;
+          listen 443 ssl default_server;
+          ssl_certificate /etc/nginx/ssl/server.crt;
+          ssl_certificate_key /etc/nginx/ssl/server.key;
+          root /var/www/html;
+          location /health {
+              return 200 OK;
+          }
+      }
+
+  - path: /var/www/html/index.html
+    content: |
+      <h1>Zscaler Mock NVA - HTTPS Successful</h1>
+      <p>Traffic: Microsoft 365 Test VM -> UDR -> ILB -> Router -> VXLAN -> NVA</p>
+
+  - path: /usr/local/bin/configure-tunnel.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # VXLAN tunnel configuration for destination-side NVA (simulates Zscaler)
+      # Run after deployment with private IPs (VNet peering required):
+      #   sudo /usr/local/bin/configure-tunnel.sh <LOCAL_PRIVATE_IP> <ROUTER1_PRIVATE_IP> <ROUTER2_PRIVATE_IP>
+
+      LOCAL_IP="${1:?Usage: configure-tunnel.sh <LOCAL_PRIVATE_IP> <ROUTER1_PRIVATE_IP> <ROUTER2_PRIVATE_IP>}"
+      ROUTER1_IP="${2:?Missing Router-1 private IP}"
+      ROUTER2_IP="${3:?Missing Router-2 private IP}"
+
+      echo "Configuring VXLAN tunnels..."
+      echo "  Local private IP:     $LOCAL_IP"
+      echo "  Router-1 private IP:  $ROUTER1_IP"
+      echo "  Router-2 private IP:  $ROUTER2_IP"
+
+      # Tunnel 1: Router-1 <-> Linux NVA (VNI 100)
+      ip link add vxlan1 type vxlan id 100 \
+        remote "$ROUTER1_IP" local "$LOCAL_IP" dstport 4789 dev eth0
+      ip addr add 172.16.0.2/30 dev vxlan1
+      ip link set vxlan1 mtu 1400
+      ip link set vxlan1 up
+
+      # Tunnel 2: Router-2 <-> Linux NVA (VNI 200)
+      ip link add vxlan2 type vxlan id 200 \
+        remote "$ROUTER2_IP" local "$LOCAL_IP" dstport 4789 dev eth0
+      ip addr add 172.16.0.6/30 dev vxlan2
+      ip link set vxlan2 mtu 1400
+      ip link set vxlan2 up
+
+      # Return route for Microsoft 365 subnet via VXLAN tunnels
+      ip route add 10.100.0.0/26 dev vxlan1 metric 100
+      ip route add 10.100.0.0/26 dev vxlan2 metric 200
+
+      echo ""
+      echo "VXLAN tunnels configured:"
+      ip -d link show vxlan1
+      ip -d link show vxlan2
+      ip addr show vxlan1
+      ip addr show vxlan2
+
+runcmd:
+  - sysctl --system
+  - mkdir -p /etc/nginx/ssl
+  - openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/nginx/ssl/server.key -out /etc/nginx/ssl/server.crt -subj '/CN=zscaler-mock.lab/O=Lab/C=US' 2>/dev/null
+  - systemctl restart nginx

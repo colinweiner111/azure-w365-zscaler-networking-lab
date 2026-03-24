@@ -1,0 +1,19 @@
+# Azure W365 + Zscaler Networking Lab
+
+## Bicep build artifacts
+*.json
+!deploy.bicepparam
+
+## OS files
+.DS_Store
+Thumbs.db
+
+## Editor
+.vscode/
+*.swp
+*.swo
+*~
+
+## Secrets
+*.env
+*.secret

@@ -1,0 +1,178 @@
+<mxfile host="65bd71144e">
+    <diagram id="lab-topology" name="Lab Topology">
+        <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1500" pageHeight="750" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+
+                <!-- ========== SOURCE VNET ========== -->
+                <mxCell id="source-vnet" value="Source VNet (W365 Side)&#xa;10.100.0.0/24" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;verticalAlign=top;spacingTop=8;fontStyle=1;fontSize=13;arcSize=6;dashed=0;" vertex="1" parent="1">
+                    <mxGeometry x="30" y="30" width="580" height="460" as="geometry"/>
+                </mxCell>
+
+                <!-- W365 Subnet -->
+                <mxCell id="w365-subnet" value="W365 Subnet&#xa;10.100.0.0/26" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;strokeWidth=1;verticalAlign=top;spacingTop=5;fontStyle=1;fontSize=11;arcSize=8;" vertex="1" parent="1">
+                    <mxGeometry x="50" y="80" width="170" height="140" as="geometry"/>
+                </mxCell>
+
+                <!-- Test VM -->
+                <mxCell id="test-vm" value="Test VM&#xa;Windows 11&#xa;(simulates W365)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#0078D4;fontColor=#ffffff;strokeColor=#005a9e;strokeWidth=1;fontSize=10;fontStyle=0;" vertex="1" parent="1">
+                    <mxGeometry x="75" y="120" width="120" height="55" as="geometry"/>
+                </mxCell>
+
+                <!-- UDR -->
+                <mxCell id="udr" value="UDR&#xa;0.0.0.0/0 → ILB" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#0078D4;fontColor=#ffffff;strokeColor=#005a9e;strokeWidth=1;fontSize=9;fontStyle=0;" vertex="1" parent="1">
+                    <mxGeometry x="85" y="190" width="100" height="30" as="geometry"/>
+                </mxCell>
+
+                <!-- C8000V Subnet -->
+                <mxCell id="c8000v-subnet" value="C8000V Subnet&#xa;10.100.0.64/27" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;strokeWidth=1;verticalAlign=top;spacingTop=5;fontStyle=1;fontSize=11;arcSize=8;" vertex="1" parent="1">
+                    <mxGeometry x="240" y="80" width="350" height="250" as="geometry"/>
+                </mxCell>
+
+                <!-- ILB -->
+                <mxCell id="ilb" value="ILB&#xa;HA Ports&#xa;Protocol: All | Port: 0" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#0078D4;fontColor=#ffffff;strokeColor=#005a9e;strokeWidth=1;fontSize=9;fontStyle=0;" vertex="1" parent="1">
+                    <mxGeometry x="265" y="140" width="115" height="50" as="geometry"/>
+                </mxCell>
+
+                <!-- C8000V-1 -->
+                <mxCell id="c8000v1" value="C8000V-1&#xa;D4s_v5 + Public IP" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DD5900;fontColor=#ffffff;strokeColor=#b34700;strokeWidth=1;fontSize=10;fontStyle=0;" vertex="1" parent="1">
+                    <mxGeometry x="420" y="120" width="140" height="40" as="geometry"/>
+                </mxCell>
+
+                <!-- C8000V-2 -->
+                <mxCell id="c8000v2" value="C8000V-2&#xa;D4s_v5 + Public IP" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DD5900;fontColor=#ffffff;strokeColor=#b34700;strokeWidth=1;fontSize=10;fontStyle=0;" vertex="1" parent="1">
+                    <mxGeometry x="420" y="200" width="140" height="40" as="geometry"/>
+                </mxCell>
+
+                <!-- SNAT labels -->
+                <mxCell id="snat1" value="SNAT" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=9;fontStyle=2;fontColor=#666666;" vertex="1" parent="1">
+                    <mxGeometry x="560" y="127" width="40" height="20" as="geometry"/>
+                </mxCell>
+                <mxCell id="snat2" value="SNAT" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=9;fontStyle=2;fontColor=#666666;" vertex="1" parent="1">
+                    <mxGeometry x="560" y="207" width="40" height="20" as="geometry"/>
+                </mxCell>
+
+                <!-- Source Bastion Subnet -->
+                <mxCell id="src-bastion-subnet" value="Bastion Subnet&#xa;10.100.0.128/27" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;strokeWidth=1;verticalAlign=top;spacingTop=5;fontStyle=1;fontSize=11;arcSize=8;" vertex="1" parent="1">
+                    <mxGeometry x="50" y="360" width="170" height="110" as="geometry"/>
+                </mxCell>
+
+                <!-- Source Bastion -->
+                <mxCell id="src-bastion" value="Azure Bastion" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#0078D4;fontColor=#ffffff;strokeColor=#005a9e;strokeWidth=1;fontSize=10;fontStyle=0;" vertex="1" parent="1">
+                    <mxGeometry x="75" y="410" width="120" height="35" as="geometry"/>
+                </mxCell>
+
+                <!-- ========== DESTINATION VNET ========== -->
+                <mxCell id="dest-vnet" value="Destination VNet (Zscaler Mock)&#xa;10.200.0.0/24" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;verticalAlign=top;spacingTop=8;fontStyle=1;fontSize=13;arcSize=6;" vertex="1" parent="1">
+                    <mxGeometry x="850" y="30" width="360" height="460" as="geometry"/>
+                </mxCell>
+
+                <!-- NVA Subnet -->
+                <mxCell id="nva-subnet" value="NVA Subnet&#xa;10.200.0.0/27" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;strokeWidth=1;verticalAlign=top;spacingTop=5;fontStyle=1;fontSize=11;arcSize=8;" vertex="1" parent="1">
+                    <mxGeometry x="880" y="80" width="300" height="180" as="geometry"/>
+                </mxCell>
+
+                <!-- Linux NVA -->
+                <mxCell id="linux-nva" value="Linux NVA&#xa;Ubuntu 22.04&#xa;GRE termination&#xa;+ Public IP" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#107C10;fontColor=#ffffff;strokeColor=#0b5a0b;strokeWidth=1;fontSize=10;fontStyle=0;" vertex="1" parent="1">
+                    <mxGeometry x="950" y="130" width="150" height="65" as="geometry"/>
+                </mxCell>
+
+                <!-- Dest Bastion Subnet -->
+                <mxCell id="dest-bastion-subnet" value="Bastion Subnet&#xa;10.200.0.128/27" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;strokeWidth=1;verticalAlign=top;spacingTop=5;fontStyle=1;fontSize=11;arcSize=8;" vertex="1" parent="1">
+                    <mxGeometry x="880" y="360" width="300" height="110" as="geometry"/>
+                </mxCell>
+
+                <!-- Dest Bastion -->
+                <mxCell id="dest-bastion" value="Azure Bastion" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#0078D4;fontColor=#ffffff;strokeColor=#005a9e;strokeWidth=1;fontSize=10;fontStyle=0;" vertex="1" parent="1">
+                    <mxGeometry x="970" y="410" width="120" height="35" as="geometry"/>
+                </mxCell>
+
+                <!-- ========== TRAFFIC FLOW ARROWS ========== -->
+
+                <!-- Test VM → ILB -->
+                <mxCell id="flow1" value="" style="endArrow=block;endFill=1;strokeColor=#0078D4;strokeWidth=2;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="test-vm" target="ilb">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="flow1-label" value="UDR" style="edgeLabel;html=1;align=center;verticalAlign=bottom;resizable=0;points=[];fontSize=9;fontStyle=1;fontColor=#0078D4;" vertex="1" connectable="0" parent="flow1">
+                    <mxGeometry x="-0.1" relative="1" as="geometry">
+                        <mxPoint y="-5" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+
+                <!-- ILB → C8000V-1 -->
+                <mxCell id="flow2a" value="" style="endArrow=block;endFill=1;strokeColor=#0078D4;strokeWidth=2;exitX=1;exitY=0.25;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="ilb" target="c8000v1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+
+                <!-- ILB → C8000V-2 -->
+                <mxCell id="flow2b" value="" style="endArrow=block;endFill=1;strokeColor=#0078D4;strokeWidth=2;exitX=1;exitY=0.75;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="ilb" target="c8000v2">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+
+                <!-- ========== GRE TUNNELS ========== -->
+
+                <!-- GRE Tunnel 1 -->
+                <mxCell id="gre1" value="" style="endArrow=block;endFill=1;startArrow=block;startFill=1;strokeColor=#FF6600;strokeWidth=3;dashed=1;dashPattern=8 4;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.35;entryDx=0;entryDy=0;" edge="1" parent="1" source="c8000v1" target="linux-nva">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="gre1-label" value="GRE Tunnel 1&#xa;172.16.0.0/30" style="edgeLabel;html=1;align=center;verticalAlign=bottom;resizable=0;points=[];fontSize=9;fontStyle=1;fontColor=#FF6600;" vertex="1" connectable="0" parent="gre1">
+                    <mxGeometry x="0.05" relative="1" as="geometry">
+                        <mxPoint y="-8" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+
+                <!-- GRE Tunnel 2 -->
+                <mxCell id="gre2" value="" style="endArrow=block;endFill=1;startArrow=block;startFill=1;strokeColor=#FF6600;strokeWidth=3;dashed=1;dashPattern=8 4;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.65;entryDx=0;entryDy=0;" edge="1" parent="1" source="c8000v2" target="linux-nva">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="gre2-label" value="GRE Tunnel 2&#xa;172.16.0.4/30" style="edgeLabel;html=1;align=center;verticalAlign=top;resizable=0;points=[];fontSize=9;fontStyle=1;fontColor=#FF6600;" vertex="1" connectable="0" parent="gre2">
+                    <mxGeometry x="0.05" relative="1" as="geometry">
+                        <mxPoint y="8" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+
+                <!-- "Over Public IPs" label -->
+                <mxCell id="pip-label" value="over Public IPs" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=10;fontStyle=2;fontColor=#FF6600;" vertex="1" parent="1">
+                    <mxGeometry x="680" y="90" width="100" height="20" as="geometry"/>
+                </mxCell>
+
+                <!-- ========== LEGEND ========== -->
+                <mxCell id="legend" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;strokeWidth=1;arcSize=8;" vertex="1" parent="1">
+                    <mxGeometry x="30" y="530" width="520" height="55" as="geometry"/>
+                </mxCell>
+                <mxCell id="legend-title" value="Legend" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+                    <mxGeometry x="40" y="532" width="50" height="20" as="geometry"/>
+                </mxCell>
+
+                <!-- Legend: traffic flow line -->
+                <mxCell id="leg-flow-line" value="" style="endArrow=block;endFill=1;strokeColor=#0078D4;strokeWidth=2;" edge="1" parent="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <mxPoint x="50" y="565" as="sourcePoint"/>
+                        <mxPoint x="110" y="565" as="targetPoint"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="leg-flow-text" value="Traffic flow (ILB path)" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="115" y="555" width="130" height="20" as="geometry"/>
+                </mxCell>
+
+                <!-- Legend: GRE tunnel line -->
+                <mxCell id="leg-gre-line" value="" style="endArrow=block;endFill=1;startArrow=block;startFill=1;strokeColor=#FF6600;strokeWidth=3;dashed=1;dashPattern=8 4;" edge="1" parent="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <mxPoint x="280" y="565" as="sourcePoint"/>
+                        <mxPoint x="340" y="565" as="targetPoint"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="leg-gre-text" value="GRE tunnel (over public IPs)" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=10;" vertex="1" parent="1">
+                    <mxGeometry x="345" y="555" width="170" height="20" as="geometry"/>
+                </mxCell>
+
+                <!-- Traffic path summary -->
+                <mxCell id="path-summary" value="Traffic path:  Test VM → UDR → ILB (HA Ports) → C8000V → GRE tunnel → Linux NVA" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=11;fontStyle=1;fontColor=#333333;" vertex="1" parent="1">
+                    <mxGeometry x="300" y="600" width="480" height="20" as="geometry"/>
+                </mxCell>
+
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>

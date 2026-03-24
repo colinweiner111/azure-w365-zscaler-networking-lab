@@ -1,0 +1,79 @@
+#cloud-config
+# Cloud-init for source-side Linux routers
+# Performs: VXLAN tunnel termination, SNAT, IP forwarding
+# Note: Azure blocks GRE (protocol 47) between VMs. VXLAN (UDP 4789) works.
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - iproute2
+  - iptables
+  - tcpdump
+  - traceroute
+
+write_files:
+  - path: /etc/sysctl.d/99-ip-forward.conf
+    content: |
+      net.ipv4.ip_forward = 1
+      net.ipv4.conf.all.accept_redirects = 0
+      net.ipv4.conf.all.send_redirects = 0
+      net.ipv4.conf.all.rp_filter = 0
+      net.ipv4.conf.default.rp_filter = 0
+
+  - path: /usr/local/bin/configure-tunnel.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # VXLAN tunnel + SNAT configuration for source-side Linux router
+      # Run after deployment with private IPs (VNet peering required):
+      #   sudo /usr/local/bin/configure-tunnel.sh <LOCAL_PRIVATE_IP> <NVA_PRIVATE_IP> <TUNNEL_NUM>
+      #
+      # TUNNEL_NUM: 1 for router-1 (overlay 172.16.0.1/30, VNI 100)
+      #             2 for router-2 (overlay 172.16.0.5/30, VNI 200)
+
+      LOCAL_IP="${1:?Usage: configure-tunnel.sh <LOCAL_PRIVATE_IP> <NVA_PRIVATE_IP> <TUNNEL_NUM>}"
+      NVA_IP="${2:?Missing Linux NVA private IP}"
+      TUNNEL_NUM="${3:?Missing tunnel number (1 or 2)}"
+
+      if [ "$TUNNEL_NUM" = "1" ]; then
+        OVERLAY_LOCAL="172.16.0.1"
+        VNI=100
+      elif [ "$TUNNEL_NUM" = "2" ]; then
+        OVERLAY_LOCAL="172.16.0.5"
+        VNI=200
+      else
+        echo "ERROR: TUNNEL_NUM must be 1 or 2"; exit 1
+      fi
+
+      echo "Configuring VXLAN tunnel + SNAT..."
+      echo "  Local private IP:   $LOCAL_IP"
+      echo "  NVA private IP:     $NVA_IP"
+      echo "  Tunnel number:      $TUNNEL_NUM (VNI $VNI)"
+      echo "  Overlay address:    $OVERLAY_LOCAL/30"
+
+      # Create VXLAN tunnel
+      ip link add vxlan${TUNNEL_NUM} type vxlan id $VNI \
+        remote "$NVA_IP" local "$LOCAL_IP" dstport 4789 dev eth0
+      ip addr add ${OVERLAY_LOCAL}/30 dev vxlan${TUNNEL_NUM}
+      ip link set vxlan${TUNNEL_NUM} mtu 1400
+      ip link set vxlan${TUNNEL_NUM} up
+
+      # SNAT — masquerade outbound traffic through VXLAN
+      iptables -t nat -A POSTROUTING -o vxlan${TUNNEL_NUM} -j MASQUERADE
+
+      # Accept forwarded traffic
+      iptables -A FORWARD -i eth0 -o vxlan${TUNNEL_NUM} -j ACCEPT
+      iptables -A FORWARD -i vxlan${TUNNEL_NUM} -o eth0 \
+        -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+      echo ""
+      echo "VXLAN tunnel configured:"
+      ip -d link show vxlan${TUNNEL_NUM}
+      ip addr show vxlan${TUNNEL_NUM}
+      echo ""
+      echo "NAT rules:"
+      iptables -t nat -L POSTROUTING -n -v
+
+runcmd:
+  - sysctl --system
