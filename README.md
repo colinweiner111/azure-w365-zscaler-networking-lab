@@ -20,7 +20,7 @@ Deployable Bicep lab that provisions the infrastructure described in the [Micros
   - [Test 4 — Packet capture](#test-4--verify-traffic-traverses-ipsec-packet-capture)
   - [Test 5 — NVA access log](#test-5--verify-via-nva-access-log)
   - [Test 6 — IPsec + VTI status](#test-6--verify-ipsec-tunnel-status-and-vti-counters)
-  - [Test 7 — M365 force-tunnel](#test-7--m365-traffic-path-force-tunnel-behavior)
+  - [Test 7 — Split-tunnel proof](#test-7--split-tunnel-proof-zscaler-vs-m365-direct)
   - [Test summary](#test-summary)
 - [Architecture Reference](#architecture-reference)
 - [Production Reference: IPsec Tunnel & Route-Map Configuration](#production-reference-ipsec-tunnel--route-map-configuration)
@@ -289,18 +289,78 @@ vti2@NONE: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1400 ... state UNKNOWN
 
 Both IKE SAs should show `ESTABLISHED`, both ESP SAs `INSTALLED`, and VTI RX/TX byte counts should be non-zero.
 
-### Test 7 — M365 traffic path (force-tunnel behavior)
+### Test 7 — Split-tunnel proof: Zscaler vs. M365 direct
 
-The UDR sends `0.0.0.0/0` to the ILB, meaning **all traffic** from the W365 subnet — including M365 — is force-tunneled through the routers. This matches the Zscaler ZIA deployment model.
+The routers use **policy routing** to implement split-tunnel. Traffic from the W365 subnet is handled in two ways:
 
-This test requires RDP to the **Test VM** via Bastion. Open a command prompt:
+- **General internet** → routed through the VTI tunnel → linux-nva (Zscaler) → NAT'd out with **linux-nva's public IP**
+- **M365 Optimize/Allow** IP ranges → routed direct out eth0 → NAT'd out with **router's public IP**
+
+**Step 1 — Get the public IPs for all three VMs:**
+
+```bash
+echo "linux-nva (Zscaler):"
+az vm list-ip-addresses -g rg-w365-zscaler-lab -n linux-nva \
+  --query "[0].virtualMachine.network.publicIpAddresses[0].ipAddress" -o tsv
+
+echo "router-1:"
+az vm list-ip-addresses -g rg-w365-zscaler-lab -n router-1 \
+  --query "[0].virtualMachine.network.publicIpAddresses[0].ipAddress" -o tsv
+
+echo "router-2:"
+az vm list-ip-addresses -g rg-w365-zscaler-lab -n router-2 \
+  --query "[0].virtualMachine.network.publicIpAddresses[0].ipAddress" -o tsv
 ```
-tracert -h 5 -d outlook.office365.com
+
+**Step 2 — General internet exits through Zscaler (linux-nva):**
+
+```bash
+az vm run-command invoke \
+  --resource-group rg-w365-zscaler-lab \
+  --name vm-w365-test \
+  --command-id RunPowerShellScript \
+  --scripts "curl.exe -s http://ipinfo.io/json" \
+  --query "value[0].message" --output tsv
 ```
 
-**Expected:** First hop is `10.100.0.69` or `10.100.0.70` (a router via ILB), confirming M365 traffic is also routed through the tunnel path.
+**Expected:** The `ip` field matches **linux-nva's** public IP. This proves general internet traffic traverses the IPsec tunnel to Zscaler, which NATs it out.
 
-> **Split-tunnel note:** In production, Zscaler uses PAC files or explicit proxy configuration to split M365 Optimize/Allow traffic direct while routing general web through ZIA. This lab demonstrates the force-tunnel baseline. To implement split-tunnel, add specific routes for [M365 endpoints](https://learn.microsoft.com/en-us/microsoft-365/enterprise/urls-and-ip-address-ranges) to the UDR with next-hop `Internet`.
+```json
+{
+  "ip": "<linux-nva public IP>",
+  "city": "Des Moines",
+  "region": "Iowa",
+  "country": "US",
+  "org": "AS8075 Microsoft Corporation"
+}
+```
+
+**Step 3 — Verify M365 traffic takes the direct path (bypasses tunnel):**
+
+This step resolves two FQDNs to their IP addresses, then asks the router's kernel which interface it would use to reach each one. The M365 domain (`outlook.office365.com`) should route via **eth0** (direct exit), while a non-Microsoft site (`ipinfo.io`) should route via **vti1** (IPsec tunnel to Zscaler):
+
+```bash
+az vm run-command invoke \
+  --resource-group rg-w365-zscaler-lab \
+  --name router-1 \
+  --command-id RunShellScript \
+  --scripts "dig +short outlook.office365.com | grep -E '^[0-9]+\.' | head -1 | xargs -I{} sh -c 'echo outlook.office365.com = {} && ip route get {} from 10.100.0.4 iif eth0' && echo '' && dig +short ipinfo.io | grep -E '^[0-9]+\.' | head -1 | xargs -I{} sh -c 'echo ipinfo.io = {} && ip route get {} from 10.100.0.4 iif eth0'" \
+  --query "value[0].message" --output tsv
+```
+
+**Expected:** Each FQDN resolves to an IP, then the route lookup shows the split:
+
+```
+outlook.office365.com = 52.96.x.x                        ← M365: resolved IP
+52.96.x.x from 10.100.0.4 via 10.100.0.65 dev eth0       ← routed DIRECT (bypasses tunnel)
+
+ipinfo.io = 34.117.59.81                                  ← non-Microsoft: resolved IP
+34.117.59.81 from 10.100.0.4 dev vti1                     ← routed through VTI TUNNEL (→ Zscaler)
+```
+
+Steps 2 and 3 together prove split-tunnel at the data plane: general web goes through Zscaler while M365 Optimize/Allow traffic exits directly via the routers.
+
+> **M365 IP ranges in this lab:** The routers' policy routing table includes `52.96.0.0/14` (Exchange Online), `13.107.0.0/16` (SharePoint/Teams), and `150.171.0.0/16` (Microsoft backbone). In production, use the full [M365 endpoint list](https://learn.microsoft.com/en-us/microsoft-365/enterprise/urls-and-ip-address-ranges) and automate updates with the [Office 365 IP Address and URL web service](https://learn.microsoft.com/en-us/microsoft-365/enterprise/microsoft-365-ip-web-service).
 
 ### Test summary
 
@@ -312,7 +372,7 @@ tracert -h 5 -d outlook.office365.com
 | 4 | Packet capture | router-1 | `tcpdump -i eth0 udp port 4500` | ESP-in-UDP encapsulated traffic |
 | 5 | NVA access log | linux-nva | `tail /var/log/nginx/access.log` | Requests from `172.16.0.1`/`.5` |
 | 6 | IPsec + VTI status | linux-nva | `ipsec statusall` + `ip -s link show vti1` | ESTABLISHED SAs, non-zero RX/TX |
-| 7 | M365 force-tunnel | vm-w365-test (Bastion RDP) | `tracert outlook.office365.com` | First hop = router IP |
+| 7 | Split-tunnel proof | vm-w365-test + router | `curl.exe ipinfo.io` + `ip route get` | Internet → linux-nva IP; M365 → eth0 direct |
 
 ---
 

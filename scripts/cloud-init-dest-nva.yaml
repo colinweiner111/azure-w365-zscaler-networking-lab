@@ -152,6 +152,10 @@ write_files:
       ip route add 10.100.0.0/26 dev vti1 metric 100
       ip route add 10.100.0.0/26 dev vti2 metric 200
 
+      # ── SNAT — masquerade internet traffic arriving from VTI tunnels ──
+      iptables -t nat -C POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+
       echo ""
       echo "IPsec VTI tunnels configured:"
       ip -d link show vti1
@@ -161,6 +165,25 @@ write_files:
       echo ""
       echo "IPsec status:"
       ipsec statusall
+
+      # ── Persist for reboot: create systemd oneshot service ──
+      cat > /etc/systemd/system/ipsec-tunnel.service <<EOF
+      [Unit]
+      Description=IPsec VTI tunnels and internet MASQUERADE
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/configure-tunnel.sh ${LOCAL_IP} ${ROUTER1_IP} ${ROUTER2_IP}
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+      systemctl daemon-reload
+      systemctl enable ipsec-tunnel.service
+      echo "Enabled ipsec-tunnel.service for boot persistence."
 
 runcmd:
   - sysctl --system
