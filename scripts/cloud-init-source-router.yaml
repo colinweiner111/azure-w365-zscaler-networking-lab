@@ -1,12 +1,14 @@
 #cloud-config
 # Cloud-init for source-side Linux routers
-# Performs: VXLAN tunnel termination, SNAT, IP forwarding
-# Note: Azure blocks GRE (protocol 47) between VMs. VXLAN (UDP 4789) works.
+# Performs: IPsec (IKEv2 + ESP) VTI tunnel, SNAT, IP forwarding
+# Uses strongSwan with route-based VTI — matches production IPsec pattern.
 
 package_update: true
 package_upgrade: false
 
 packages:
+  - strongswan
+  - strongswan-swanctl
   - iproute2
   - iptables
   - tcpdump
@@ -20,60 +22,122 @@ write_files:
       net.ipv4.conf.all.send_redirects = 0
       net.ipv4.conf.all.rp_filter = 0
       net.ipv4.conf.default.rp_filter = 0
+      net.ipv4.conf.eth0.rp_filter = 0
 
   - path: /usr/local/bin/configure-tunnel.sh
     permissions: "0755"
     content: |
       #!/bin/bash
-      # VXLAN tunnel + SNAT configuration for source-side Linux router
+      # IPsec VTI tunnel + SNAT configuration for source-side Linux router
       # Run after deployment with private IPs (VNet peering required):
       #   sudo /usr/local/bin/configure-tunnel.sh <LOCAL_PRIVATE_IP> <NVA_PRIVATE_IP> <TUNNEL_NUM>
       #
-      # TUNNEL_NUM: 1 for router-1 (overlay 172.16.0.1/30, VNI 100)
-      #             2 for router-2 (overlay 172.16.0.5/30, VNI 200)
+      # TUNNEL_NUM: 1 for router-1 (overlay 172.16.0.1/30)
+      #             2 for router-2 (overlay 172.16.0.5/30)
+
+      set -euo pipefail
 
       LOCAL_IP="${1:?Usage: configure-tunnel.sh <LOCAL_PRIVATE_IP> <NVA_PRIVATE_IP> <TUNNEL_NUM>}"
       NVA_IP="${2:?Missing Linux NVA private IP}"
       TUNNEL_NUM="${3:?Missing tunnel number (1 or 2)}"
 
+      PSK="LabIPsecKey2026!"
+
       if [ "$TUNNEL_NUM" = "1" ]; then
         OVERLAY_LOCAL="172.16.0.1"
-        VNI=100
+        VTI_KEY=1
       elif [ "$TUNNEL_NUM" = "2" ]; then
         OVERLAY_LOCAL="172.16.0.5"
-        VNI=200
+        VTI_KEY=2
       else
         echo "ERROR: TUNNEL_NUM must be 1 or 2"; exit 1
       fi
 
-      echo "Configuring VXLAN tunnel + SNAT..."
+      echo "Configuring IPsec VTI tunnel + SNAT..."
       echo "  Local private IP:   $LOCAL_IP"
       echo "  NVA private IP:     $NVA_IP"
-      echo "  Tunnel number:      $TUNNEL_NUM (VNI $VNI)"
+      echo "  Tunnel number:      $TUNNEL_NUM"
       echo "  Overlay address:    $OVERLAY_LOCAL/30"
 
-      # Create VXLAN tunnel
-      ip link add vxlan${TUNNEL_NUM} type vxlan id $VNI \
-        remote "$NVA_IP" local "$LOCAL_IP" dstport 4789 dev eth0
-      ip addr add ${OVERLAY_LOCAL}/30 dev vxlan${TUNNEL_NUM}
-      ip link set vxlan${TUNNEL_NUM} mtu 1400
-      ip link set vxlan${TUNNEL_NUM} up
+      # ── Clean slate: tear down any previous IPsec state ──
+      ipsec stop 2>/dev/null || true
+      ip xfrm state flush  2>/dev/null || true
+      ip xfrm policy flush 2>/dev/null || true
+      ip link del vti${TUNNEL_NUM} 2>/dev/null || true
 
-      # SNAT — masquerade outbound traffic through VXLAN
-      iptables -t nat -A POSTROUTING -o vxlan${TUNNEL_NUM} -j MASQUERADE
+      # ── Create VTI interface ──
+      ip tunnel add vti${TUNNEL_NUM} mode vti \
+        local "$LOCAL_IP" remote "$NVA_IP" key $VTI_KEY
+      ip link set vti${TUNNEL_NUM} mtu 1400
+      ip link set vti${TUNNEL_NUM} up
+      ip addr add ${OVERLAY_LOCAL}/30 dev vti${TUNNEL_NUM}
+
+      # Disable rp_filter and XFRM policy check on VTI
+      sysctl -w net.ipv4.conf.vti${TUNNEL_NUM}.disable_policy=1
+      sysctl -w net.ipv4.conf.vti${TUNNEL_NUM}.rp_filter=0
+
+      # ── Charon: don't install routes into table 220 (conflicts with VTI) ──
+      mkdir -p /etc/strongswan.d
+      cat > /etc/strongswan.d/zz-vti.conf <<EOF
+      charon {
+        install_routes = no
+      }
+      EOF
+
+      # ── strongSwan connection config ──
+      cat > /etc/ipsec.d/tunnel${TUNNEL_NUM}.conf <<EOF
+      conn tunnel${TUNNEL_NUM}
+        authby=secret
+        auto=start
+        type=tunnel
+        keyexchange=ikev2
+        ike=aes256-sha256-modp2048
+        esp=aes256-sha256-modp2048
+        left=${LOCAL_IP}
+        leftsubnet=0.0.0.0/0
+        right=${NVA_IP}
+        rightsubnet=0.0.0.0/0
+        mark=${VTI_KEY}/${VTI_KEY}
+        forceencaps=yes
+        leftupdown=/bin/true
+      EOF
+
+      # ── Ensure ipsec.conf includes /etc/ipsec.d/*.conf ──
+      grep -q 'include /etc/ipsec.d/\*.conf' /etc/ipsec.conf 2>/dev/null || \
+        echo 'include /etc/ipsec.d/*.conf' >> /etc/ipsec.conf
+
+      # ── Write PSK secret ──
+      grep -q "${NVA_IP}" /etc/ipsec.secrets 2>/dev/null || \
+        echo "${LOCAL_IP} ${NVA_IP} : PSK \"${PSK}\"" >> /etc/ipsec.secrets
+
+      # ── Start strongSwan ──
+      ipsec start
+      sleep 5
+      ipsec up tunnel${TUNNEL_NUM}
+      sleep 2
+
+      # ── SNAT — masquerade outbound traffic through VTI ──
+      iptables -t nat -C POSTROUTING -o vti${TUNNEL_NUM} -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -o vti${TUNNEL_NUM} -j MASQUERADE
 
       # Accept forwarded traffic
-      iptables -A FORWARD -i eth0 -o vxlan${TUNNEL_NUM} -j ACCEPT
-      iptables -A FORWARD -i vxlan${TUNNEL_NUM} -o eth0 \
-        -m state --state RELATED,ESTABLISHED -j ACCEPT
+      iptables -C FORWARD -i eth0 -o vti${TUNNEL_NUM} -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i eth0 -o vti${TUNNEL_NUM} -j ACCEPT
+      iptables -C FORWARD -i vti${TUNNEL_NUM} -o eth0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i vti${TUNNEL_NUM} -o eth0 -m state --state RELATED,ESTABLISHED -j ACCEPT
 
       echo ""
-      echo "VXLAN tunnel configured:"
-      ip -d link show vxlan${TUNNEL_NUM}
-      ip addr show vxlan${TUNNEL_NUM}
+      echo "IPsec VTI tunnel configured:"
+      ip -d link show vti${TUNNEL_NUM}
+      ip addr show vti${TUNNEL_NUM}
+      echo ""
+      echo "IPsec status:"
+      ipsec statusall
       echo ""
       echo "NAT rules:"
       iptables -t nat -L POSTROUTING -n -v
 
 runcmd:
   - sysctl --system
+  - systemctl enable ipsec
+  - systemctl stop ipsec

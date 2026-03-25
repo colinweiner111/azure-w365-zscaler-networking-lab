@@ -1,12 +1,14 @@
 #cloud-config
-# Cloud-init for Linux NVA — VXLAN tunnel termination (simulates Zscaler)
+# Cloud-init for Linux NVA — IPsec tunnel termination (simulates Zscaler)
 # Includes nginx with HTTPS for realistic traffic testing.
-# Note: Azure blocks GRE (protocol 47) between VMs. VXLAN (UDP 4789) works.
+# Uses strongSwan with route-based VTI — matches production IPsec pattern.
 
 package_update: true
 package_upgrade: false
 
 packages:
+  - strongswan
+  - strongswan-swanctl
   - iproute2
   - tcpdump
   - traceroute
@@ -37,52 +39,133 @@ write_files:
   - path: /var/www/html/index.html
     content: |
       <h1>Zscaler Mock NVA - HTTPS Successful</h1>
-      <p>Traffic: Microsoft 365 Test VM -> UDR -> ILB -> Router -> VXLAN -> NVA</p>
+      <p>Traffic: Microsoft 365 Test VM -> UDR -> ILB -> Router -> IPsec -> NVA</p>
 
   - path: /usr/local/bin/configure-tunnel.sh
     permissions: "0755"
     content: |
       #!/bin/bash
-      # VXLAN tunnel configuration for destination-side NVA (simulates Zscaler)
+      # IPsec VTI tunnel configuration for destination-side NVA (simulates Zscaler)
       # Run after deployment with private IPs (VNet peering required):
       #   sudo /usr/local/bin/configure-tunnel.sh <LOCAL_PRIVATE_IP> <ROUTER1_PRIVATE_IP> <ROUTER2_PRIVATE_IP>
+
+      set -euo pipefail
 
       LOCAL_IP="${1:?Usage: configure-tunnel.sh <LOCAL_PRIVATE_IP> <ROUTER1_PRIVATE_IP> <ROUTER2_PRIVATE_IP>}"
       ROUTER1_IP="${2:?Missing Router-1 private IP}"
       ROUTER2_IP="${3:?Missing Router-2 private IP}"
 
-      echo "Configuring VXLAN tunnels..."
+      PSK="LabIPsecKey2026!"
+
+      echo "Configuring IPsec VTI tunnels..."
       echo "  Local private IP:     $LOCAL_IP"
       echo "  Router-1 private IP:  $ROUTER1_IP"
       echo "  Router-2 private IP:  $ROUTER2_IP"
 
-      # Tunnel 1: Router-1 <-> Linux NVA (VNI 100)
-      ip link add vxlan1 type vxlan id 100 \
-        remote "$ROUTER1_IP" local "$LOCAL_IP" dstport 4789 dev eth0
-      ip addr add 172.16.0.2/30 dev vxlan1
-      ip link set vxlan1 mtu 1400
-      ip link set vxlan1 up
+      # ── Clean slate: tear down any previous IPsec state ──
+      ipsec stop 2>/dev/null || true
+      ip xfrm state flush  2>/dev/null || true
+      ip xfrm policy flush 2>/dev/null || true
+      ip link del vti1 2>/dev/null || true
+      ip link del vti2 2>/dev/null || true
 
-      # Tunnel 2: Router-2 <-> Linux NVA (VNI 200)
-      ip link add vxlan2 type vxlan id 200 \
-        remote "$ROUTER2_IP" local "$LOCAL_IP" dstport 4789 dev eth0
-      ip addr add 172.16.0.6/30 dev vxlan2
-      ip link set vxlan2 mtu 1400
-      ip link set vxlan2 up
+      # ── VTI 1: Router-1 <-> NVA (overlay 172.16.0.0/30) ──
+      ip tunnel add vti1 mode vti \
+        local "$LOCAL_IP" remote "$ROUTER1_IP" key 1
+      ip link set vti1 mtu 1400
+      ip link set vti1 up
+      ip addr add 172.16.0.2/30 dev vti1
+      sysctl -w net.ipv4.conf.vti1.disable_policy=1
+      sysctl -w net.ipv4.conf.vti1.rp_filter=0
 
-      # Return route for Microsoft 365 subnet via VXLAN tunnels
-      ip route add 10.100.0.0/26 dev vxlan1 metric 100
-      ip route add 10.100.0.0/26 dev vxlan2 metric 200
+      # ── VTI 2: Router-2 <-> NVA (overlay 172.16.0.4/30) ──
+      ip tunnel add vti2 mode vti \
+        local "$LOCAL_IP" remote "$ROUTER2_IP" key 2
+      ip link set vti2 mtu 1400
+      ip link set vti2 up
+      ip addr add 172.16.0.6/30 dev vti2
+      sysctl -w net.ipv4.conf.vti2.disable_policy=1
+      sysctl -w net.ipv4.conf.vti2.rp_filter=0
+
+      # ── Charon: don't install routes into table 220 (conflicts with VTI) ──
+      mkdir -p /etc/strongswan.d
+      cat > /etc/strongswan.d/zz-vti.conf <<EOF
+      charon {
+        install_routes = no
+      }
+      EOF
+
+      # ── strongSwan config for tunnel 1 (Router-1) ──
+      cat > /etc/ipsec.d/tunnel1.conf <<EOF
+      conn tunnel1
+        authby=secret
+        auto=start
+        type=tunnel
+        keyexchange=ikev2
+        ike=aes256-sha256-modp2048
+        esp=aes256-sha256-modp2048
+        left=${LOCAL_IP}
+        leftsubnet=0.0.0.0/0
+        right=${ROUTER1_IP}
+        rightsubnet=0.0.0.0/0
+        mark=1/1
+        forceencaps=yes
+        leftupdown=/bin/true
+      EOF
+
+      # ── strongSwan config for tunnel 2 (Router-2) ──
+      cat > /etc/ipsec.d/tunnel2.conf <<EOF
+      conn tunnel2
+        authby=secret
+        auto=start
+        type=tunnel
+        keyexchange=ikev2
+        ike=aes256-sha256-modp2048
+        esp=aes256-sha256-modp2048
+        left=${LOCAL_IP}
+        leftsubnet=0.0.0.0/0
+        right=${ROUTER2_IP}
+        rightsubnet=0.0.0.0/0
+        mark=2/2
+        forceencaps=yes
+        leftupdown=/bin/true
+      EOF
+
+      # ── Ensure ipsec.conf includes /etc/ipsec.d/*.conf ──
+      grep -q 'include /etc/ipsec.d/\*.conf' /etc/ipsec.conf 2>/dev/null || \
+        echo 'include /etc/ipsec.d/*.conf' >> /etc/ipsec.conf
+
+      # ── Write PSK secrets ──
+      > /etc/ipsec.secrets
+      echo "${LOCAL_IP} ${ROUTER1_IP} : PSK \"${PSK}\"" >> /etc/ipsec.secrets
+      echo "${LOCAL_IP} ${ROUTER2_IP} : PSK \"${PSK}\"" >> /etc/ipsec.secrets
+
+      # ── Start strongSwan ──
+      ipsec start
+      sleep 5
+      ipsec up tunnel1
+      sleep 2
+      ipsec up tunnel2
+      sleep 2
+
+      # ── Return route for Microsoft 365 subnet via VTI tunnels ──
+      ip route add 10.100.0.0/26 dev vti1 metric 100
+      ip route add 10.100.0.0/26 dev vti2 metric 200
 
       echo ""
-      echo "VXLAN tunnels configured:"
-      ip -d link show vxlan1
-      ip -d link show vxlan2
-      ip addr show vxlan1
-      ip addr show vxlan2
+      echo "IPsec VTI tunnels configured:"
+      ip -d link show vti1
+      ip -d link show vti2
+      ip addr show vti1
+      ip addr show vti2
+      echo ""
+      echo "IPsec status:"
+      ipsec statusall
 
 runcmd:
   - sysctl --system
+  - systemctl enable ipsec
+  - systemctl stop ipsec
   - mkdir -p /etc/nginx/ssl
   - openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/nginx/ssl/server.key -out /etc/nginx/ssl/server.crt -subj '/CN=zscaler-mock.lab/O=Lab/C=US' 2>/dev/null
   - systemctl restart nginx

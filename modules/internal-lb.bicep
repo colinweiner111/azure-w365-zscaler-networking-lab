@@ -54,7 +54,7 @@ resource lb 'Microsoft.Network/loadBalancers@2024-05-01' = {
           protocol: 'All'
           frontendPort: 0
           backendPort: 0
-          enableFloatingIP: false
+          enableFloatingIP: true
           idleTimeoutInMinutes: 4
           loadDistribution: 'SourceIP'
         }

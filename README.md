@@ -1,8 +1,8 @@
 # Microsoft 365 + Zscaler Networking Lab
 
-Deployable Bicep lab that provisions the infrastructure described in the [Microsoft 365 + Zscaler Networking Architecture & POC](https://github.com/colinweiner111/azure-w365-zscaler-networking-poc). Two Linux routers forward Microsoft 365 traffic through VXLAN tunnels to a Linux NVA that simulates Zscaler ZIA tunnel termination.
+Deployable Bicep lab that provisions the infrastructure described in the [Microsoft 365 + Zscaler Networking Architecture & POC](https://github.com/colinweiner111/azure-w365-zscaler-networking-poc). Two Linux routers forward Microsoft 365 traffic through IPsec tunnels (strongSwan IKEv2 + ESP with VTI) to a Linux NVA that simulates Zscaler ZIA tunnel termination.
 
-> **Why VXLAN instead of GRE?** Azure's SDN drops IP protocol 47 (GRE) between VMs. VXLAN (UDP 4789) over VNet peering is the supported alternative.
+> **Why strongSwan IPsec?** Azure does not support GRE (IP protocol 47) — the hypervisor vSwitch drops it in all directions. This lab uses IPsec (IKEv2 + ESP) with route-based VTI interfaces, matching the exact tunnel protocol used in production Zscaler deployments on Azure.
 
 ---
 
@@ -22,19 +22,19 @@ Deployable Bicep lab that provisions the infrastructure described in the [Micros
 
 | Subnet | CIDR | Resources |
 |---|---|---|
-| NVA Subnet | `10.200.0.0/27` | Linux NVA (Ubuntu 22.04 — VXLAN termination) |
+| NVA Subnet | `10.200.0.0/27` | Linux NVA (Ubuntu 22.04 — IPsec termination + nginx HTTPS) |
 | Bastion Subnet | `10.200.0.128/27` | Azure Bastion |
 
 **VNet Peering** — bidirectional with `allowForwardedTraffic: true`
 
-**VXLAN Tunnels** (over private IPs via VNet peering)
+**IPsec Tunnels** (IKEv2 + ESP via strongSwan, over private IPs via VNet peering)
 
-| Tunnel | VNI | Source (Router) | Destination (NVA) | Overlay |
+| Tunnel | VTI Key | Source (Router) | Destination (NVA) | Overlay |
 |---|---|---|---|---|
-| vxlan1 | 100 | Router-1 private IP | NVA private IP | `172.16.0.0/30` |
-| vxlan2 | 200 | Router-2 private IP | NVA private IP | `172.16.0.4/30` |
+| vti1 | 1 | Router-1 private IP | NVA private IP | `172.16.0.0/30` |
+| vti2 | 2 | Router-2 private IP | NVA private IP | `172.16.0.4/30` |
 
-> **Traffic path:** Test VM → UDR → ILB (HA Ports) → Linux Router → SNAT → VXLAN tunnel → Linux NVA
+> **Traffic path:** Test VM → UDR → ILB (HA Ports, Floating IP) → Linux Router → SNAT → IPsec tunnel → Linux NVA
 
 ---
 
@@ -72,7 +72,7 @@ az deployment group create \
 
 > Deployment takes approximately 10–15 minutes (Bastion hosts take the longest).
 
-### 4. Post-deployment: Configure VXLAN tunnels
+### 4. Post-deployment: Configure IPsec tunnels
 
 After deployment completes, run the commands below from your local terminal. They pull the private IPs from the deployment outputs and configure each VM remotely — no need to SSH in manually.
 
@@ -112,35 +112,35 @@ az vm run-command invoke \
   --scripts "sudo /usr/local/bin/configure-tunnel.sh $NVA_IP $ROUTER1_IP $ROUTER2_IP"
 ```
 
-> The `configure-tunnel.sh` scripts are installed by cloud-init during VM provisioning. They create the VXLAN interfaces, assign overlay IPs, configure SNAT (routers), and add return routes (NVA).
+> The `configure-tunnel.sh` scripts are installed by cloud-init during VM provisioning. They create IPsec VTI interfaces via strongSwan, assign overlay IPs, configure SNAT (routers), and add return routes (NVA).
 
 ---
 
 ## Testing
 
-After configuring the VXLAN tunnels, run the following tests to validate HTTPS traffic through the full path and verify it traverses the VXLAN tunnel.
+After configuring the IPsec tunnels, run the following tests to validate HTTPS traffic through the full path and verify it traverses the IPsec tunnel.
 
 The NVA runs nginx with a self-signed TLS certificate (installed via cloud-init), serving an HTTPS health endpoint that simulates Zscaler web inspection.
 
-### Test 1 — HTTPS through VXLAN tunnel 1
+### Test 1 — HTTPS through IPsec tunnel 1
 
 SSH to **Router-1** via Bastion:
 ```bash
 curl -sk -o /dev/null -w 'Status: %{http_code}, Time: %{time_total}s\n' https://172.16.0.2/health
 curl -sk https://172.16.0.2/health
 ```
-**Expected:** `Status: 200`, response `OK`. Confirms HTTPS (TCP 443) works end-to-end through VXLAN tunnel 1 (VNI 100).
+**Expected:** `Status: 200`, response `OK`. Confirms HTTPS (TCP 443) works end-to-end through IPsec tunnel 1 (VTI key 1).
 
-### Test 2 — HTTPS through VXLAN tunnel 2
+### Test 2 — HTTPS through IPsec tunnel 2
 
 SSH to **Router-2** via Bastion:
 ```bash
 curl -sk -o /dev/null -w 'Status: %{http_code}, Time: %{time_total}s\n' https://172.16.0.6/health
 curl -sk https://172.16.0.6/health
 ```
-**Expected:** `Status: 200`, response `OK`. Confirms HTTPS through VXLAN tunnel 2 (VNI 200).
+**Expected:** `Status: 200`, response `OK`. Confirms HTTPS through IPsec tunnel 2 (VTI key 2).
 
-### Test 3 — End-to-end HTTPS: Test VM → ILB → Router → VXLAN → NVA
+### Test 3 — End-to-end HTTPS: Test VM → ILB → Router → IPsec → NVA
 
 RDP to the **Test VM** via Bastion. Open PowerShell:
 ```powershell
@@ -154,34 +154,36 @@ $web.DownloadString('https://172.16.0.2/health')
 ```
 Test VM (10.100.0.4)
     → UDR (0.0.0.0/0 → 10.100.0.68)
-    → ILB (HA Ports, hash-based distribution)
-    → Router-1 (SNAT + VXLAN encap)
+    → ILB (HA Ports, Floating IP preserves original dest)
+    → Router-1 (SNAT + IPsec encap)
     → VNet peering (private IP underlay)
-    → Linux NVA nginx (VXLAN decap → TLS termination at 172.16.0.2:443)
+    → Linux NVA nginx (IPsec decap → TLS termination at 172.16.0.2:443)
 ```
 
-### Test 4 — Verify traffic traverses VXLAN (packet capture)
+> **Key config:** Floating IP (`enableFloatingIP: true`) must be enabled on the ILB HA Ports rule so the original destination IP (172.16.0.2) is preserved when forwarded to the router. Without it, the ILB rewrites the destination to the backend IP and the router can't make a forwarding decision. The W365 and router subnet NSGs also need explicit rules allowing traffic to VTI overlay addresses (172.16.0.0/28), since these private IPs are outside the `VirtualNetwork` service tag.
 
-This is the key proof that HTTPS is encapsulated inside VXLAN, not routed via Azure's SDN.
+### Test 4 — Verify traffic traverses IPsec (packet capture)
+
+This is the key proof that HTTPS is encapsulated inside ESP, not routed via Azure's SDN.
+
+> **Note:** The lab uses `forceencaps=yes` (NAT-T), so ESP is wrapped inside UDP port 4500. Use `udp port 4500` as the tcpdump filter — a raw `esp` filter will not match.
 
 SSH to **Router-1** via Bastion:
 ```bash
 # Start tcpdump on eth0 (underlay) while curling NVA over the overlay
-sudo bash -c 'timeout 8 tcpdump -i eth0 udp port 4789 -nn -c 10 > /tmp/cap.txt 2>&1 &
+sudo bash -c 'timeout 8 tcpdump -i eth0 udp port 4500 -nn -c 10 > /tmp/cap.txt 2>&1 &
 sleep 1; curl -sk https://172.16.0.2/health; sleep 5; cat /tmp/cap.txt'
 ```
 
-**Expected output** (each HTTPS packet wrapped in VXLAN):
+**Expected output** (HTTPS packets wrapped in ESP-in-UDP):
 ```
-IP 10.100.0.69.xxxxx > 10.200.0.4.4789: VXLAN, flags [I] (0x08), vni 100
-IP 172.16.0.1.xxxxx > 172.16.0.2.443: Flags [S], ...     # TLS SYN
-IP 10.200.0.4.xxxxx > 10.100.0.69.4789: VXLAN, flags [I] (0x08), vni 100
-IP 172.16.0.2.443 > 172.16.0.1.xxxxx: Flags [S.], ...    # TLS SYN-ACK
+IP 10.100.0.69.4500 > 10.200.0.4.4500: UDP-encap: ESP(spi=0xXXXXXXXX,seq=0xN), length ...
+IP 10.200.0.4.4500 > 10.100.0.69.4500: UDP-encap: ESP(spi=0xXXXXXXXX,seq=0xN), length ...
 ```
 
-The two layers visible in each line prove:
-- **Outer header:** `10.100.0.69 → 10.200.0.4` on UDP 4789 (VXLAN underlay over VNet peering)
-- **Inner header:** `172.16.0.1 → 172.16.0.2` on TCP 443 (HTTPS inside the tunnel)
+The ESP-in-UDP packets prove:
+- **Outer header:** `10.100.0.69:4500 → 10.200.0.4:4500` (NAT-T encapsulation over VNet peering)
+- **Inner payload:** encrypted HTTPS (TCP 443) traffic inside the IPsec tunnel
 
 ### Test 5 — Verify via NVA access log
 
@@ -196,13 +198,14 @@ tail -10 /var/log/nginx/access.log
 172.16.0.5 - - [timestamp] "GET /health HTTP/1.1" 200 2 "-" "curl/7.81.0"
 ```
 
-Source `172.16.0.1` = Router-1 (after SNAT), `172.16.0.5` = Router-2. This confirms HTTPS arrived through the VXLAN overlay, not via the Azure underlay.
+Source `172.16.0.1` = Router-1 (after SNAT), `172.16.0.5` = Router-2. This confirms HTTPS arrived through the IPsec overlay, not via the Azure underlay.
 
-### Test 6 — Verify VXLAN interface counters
+### Test 6 — Verify IPsec tunnel status and VTI counters
 
 ```bash
-ip -s link show vxlan1    # RX/TX byte and packet counts
-ip -s link show vxlan2    # Should show non-zero counters after tests
+ipsec statusall                   # Show SA status (ESTABLISHED = healthy)
+ip -s link show vti1              # RX/TX byte and packet counts
+ip -s link show vti2              # Should show non-zero counters after tests
 ```
 
 ### Test 7 — M365 traffic path (force-tunnel behavior)
@@ -225,34 +228,34 @@ tracert -h 5 -d outlook.office365.com
 | 1 | HTTPS tunnel 1 | Router-1 | `curl -sk https://172.16.0.2/health` | `OK` (HTTP 200) |
 | 2 | HTTPS tunnel 2 | Router-2 | `curl -sk https://172.16.0.6/health` | `OK` (HTTP 200) |
 | 3 | HTTPS end-to-end | Test VM | PowerShell WebClient to `172.16.0.2` | `OK` (HTTP 200) |
-| 4 | Packet capture | Router-1 | `tcpdump -i eth0 udp port 4789` | VXLAN-encapsulated TCP 443 |
+| 4 | Packet capture | Router-1 | `tcpdump -i eth0 udp port 4500` | ESP-in-UDP encapsulated traffic |
 | 5 | NVA access log | NVA | `tail /var/log/nginx/access.log` | Requests from `172.16.0.1`/`.5` |
-| 6 | Interface counters | NVA | `ip -s link show vxlan1` | Non-zero RX/TX |
+| 6 | IPsec + VTI status | NVA | `ipsec statusall` + `ip -s link show vti1` | ESTABLISHED SAs, non-zero RX/TX |
 | 7 | M365 force-tunnel | Test VM | `tracert outlook.office365.com` | First hop = router IP |
 
 ### Running tests via Azure CLI (without Bastion)
 
 ```bash
-# HTTPS from Router-1 through VXLAN
+# HTTPS from Router-1 through IPsec
 az vm run-command invoke \
   --resource-group rg-w365-zscaler-lab \
   --name router-1 \
   --command-id RunShellScript \
   --scripts "curl -sk https://172.16.0.2/health"
 
-# HTTPS from Router-2 through VXLAN
+# HTTPS from Router-2 through IPsec
 az vm run-command invoke \
   --resource-group rg-w365-zscaler-lab \
   --name router-2 \
   --command-id RunShellScript \
   --scripts "curl -sk https://172.16.0.6/health"
 
-# Packet capture proof (VXLAN encapsulation visible)
+# Packet capture proof (ESP-in-UDP encapsulation via NAT-T)
 az vm run-command invoke \
   --resource-group rg-w365-zscaler-lab \
   --name router-1 \
   --command-id RunShellScript \
-  --scripts "bash -c 'timeout 8 tcpdump -i eth0 udp port 4789 -nn -c 10 \
+  --scripts "bash -c 'timeout 8 tcpdump -i eth0 udp port 4500 -nn -c 10 \
     > /tmp/cap.txt 2>&1 & sleep 1; curl -sk https://172.16.0.2/health; \
     sleep 5; cat /tmp/cap.txt'"
 
@@ -281,33 +284,71 @@ This lab implements the architecture defined in:
 
 ---
 
-## Production Reference: GRE Tunnel & Route-Map Configuration
+## Production Reference: IPsec Tunnel & Route-Map Configuration
 
-This lab uses Linux routers with VXLAN because Azure blocks GRE (protocol 47) between VMs. Below are the production NVA configs this lab simulates.
+This lab uses Linux routers with strongSwan IPsec (IKEv2 + ESP + VTI), matching the production tunnel protocol. Below are the production C8000V NVA configs for reference.
 
-### GRE Tunnel Configuration
+### IPsec Tunnel Configuration (IKEv2 + VTI)
 
 ```
-! --- GRE Tunnel to Zscaler ZEN (primary) ---
+! --- IKEv2 Proposal ---
+crypto ikev2 proposal ZSCALER_PROPOSAL
+ encryption aes-cbc-256
+ integrity sha256
+ group 14
+!
+! --- IKEv2 Policy ---
+crypto ikev2 policy ZSCALER_POLICY
+ proposal ZSCALER_PROPOSAL
+!
+! --- IKEv2 Keyring ---
+crypto ikev2 keyring ZSCALER_KEYRING
+ peer ZSCALER_ZEN_PRIMARY
+  address <ZSCALER_ZEN_PRIMARY_IP>
+  pre-shared-key <PSK>
+ peer ZSCALER_ZEN_SECONDARY
+  address <ZSCALER_ZEN_SECONDARY_IP>
+  pre-shared-key <PSK>
+!
+! --- IKEv2 Profile ---
+crypto ikev2 profile ZSCALER_PROFILE
+ match identity remote address <ZSCALER_ZEN_PRIMARY_IP> 255.255.255.255
+ match identity remote address <ZSCALER_ZEN_SECONDARY_IP> 255.255.255.255
+ authentication remote pre-share
+ authentication local pre-share
+ keyring local ZSCALER_KEYRING
+!
+! --- IPsec Transform Set ---
+crypto ipsec transform-set ZSCALER_TS esp-aes 256 esp-sha256-hmac
+ mode tunnel
+!
+! --- IPsec Profile ---
+crypto ipsec profile ZSCALER_IPSEC_PROFILE
+ set transform-set ZSCALER_TS
+ set ikev2-profile ZSCALER_PROFILE
+!
+! --- IPsec VTI to Zscaler ZEN (primary) ---
 interface Tunnel0
- description GRE to Zscaler ZEN - Primary
+ description IPsec VTI to Zscaler ZEN - Primary
  ip address 172.16.0.1 255.255.255.252
  ip mtu 1400
  ip tcp adjust-mss 1360
  tunnel source GigabitEthernet1
  tunnel destination <ZSCALER_ZEN_PRIMARY_IP>
- tunnel mode gre ip
+ tunnel mode ipsec ipv4
+ tunnel protection ipsec profile ZSCALER_IPSEC_PROFILE
  keepalive 10 3
 !
-! --- GRE Tunnel to Zscaler ZEN (secondary) ---
+! --- IPsec VTI to Zscaler ZEN (secondary) ---
 interface Tunnel1
- description GRE to Zscaler ZEN - Secondary
+ description IPsec VTI to Zscaler ZEN - Secondary
  ip address 172.16.0.5 255.255.255.252
  ip mtu 1400
  ip tcp adjust-mss 1360
  tunnel source GigabitEthernet1
  tunnel destination <ZSCALER_ZEN_SECONDARY_IP>
- tunnel mode gre ip
+ tunnel mode ipsec ipv4
+ tunnel protection ipsec profile ZSCALER_IPSEC_PROFILE
  keepalive 10 3
 ```
 
@@ -354,14 +395,14 @@ ip access-list extended M365_OPTIMIZE_ACL
  permit ip 10.100.0.0 0.0.0.63 150.171.32.0 0.0.3.255
  permit ip 10.100.0.0 0.0.0.63 150.171.40.0 0.0.3.255
 !
-! --- Route-map: M365 Optimize → direct internet, all else → GRE ---
+! --- Route-map: M365 Optimize → direct internet, all else → IPsec ---
 route-map TRAFFIC_STEERING permit 10
  description M365 Optimize - direct internet breakout
  match ip address M365_OPTIMIZE_ACL
  set interface GigabitEthernet1
 !
 route-map TRAFFIC_STEERING permit 20
- description All other internet - GRE to Zscaler
+ description All other internet - IPsec to Zscaler
  set interface Tunnel0
 !
 ! --- Apply to inbound interface ---
@@ -372,10 +413,10 @@ interface GigabitEthernet1
 ### Multi-NVA Scaling
 
 ```
-  NVA-1 (PIP-1) ──── GRE Tunnel A ────┐
-  NVA-2 (PIP-2) ──── GRE Tunnel B ────┼──── Zscaler ZEN
-  NVA-3 (PIP-3) ──── GRE Tunnel C ────┤
-  NVA-4 (PIP-4) ──── GRE Tunnel D ────┘
+  NVA-1 (PIP-1) ──── IPsec Tunnel A ────┐
+  NVA-2 (PIP-2) ──── IPsec Tunnel B ────┼──── Zscaler ZEN
+  NVA-3 (PIP-3) ──── IPsec Tunnel C ────┤
+  NVA-4 (PIP-4) ──── IPsec Tunnel D ────┘
 ```
 
 ### Microsoft 365 Subnet UDR
@@ -390,12 +431,12 @@ interface GigabitEthernet1
 
 | Lab Component | Production Equivalent |
 |---|---|
-| Linux router (Ubuntu) + VXLAN | NVA appliance + GRE tunnel |
+| Linux router (Ubuntu) + strongSwan IPsec VTI | NVA appliance + IPsec tunnel |
 | iptables MASQUERADE | `ip nat inside source` (PAT) |
 | Linux NVA (nginx) | Zscaler ZEN node |
-| iproute2 VXLAN config | `interface Tunnel` |
+| strongSwan VTI config | `interface Tunnel` (IPsec VTI) |
 | UDR `0.0.0.0/0` → ILB | Same |
-| All traffic force-tunneled | Route-map splits M365 direct vs. GRE |
+| All traffic force-tunneled | Route-map splits M365 direct vs. IPsec |
 
 ---
 

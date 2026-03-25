@@ -35,23 +35,51 @@ var ilbFrontendIp = '10.100.0.68' // Static IP in router subnet
 // Cloud-init for destination NVA (simulates Zscaler)
 var cloudInitDest = loadFileAsBase64('scripts/cloud-init-dest-nva.yaml')
 
-// Cloud-init for source-side Linux routers (VXLAN + SNAT)
+// Cloud-init for source-side Linux routers (IPsec VTI + SNAT)
 var cloudInitSource = loadFileAsBase64('scripts/cloud-init-source-router.yaml')
 
-// NSG rules for router subnet — allow VXLAN (UDP 4789) inbound
+// NSG rules for router subnet — allow IPsec (IKE + NAT-T + ESP) inbound
 var routerNsgRules = [
   {
-    name: 'AllowVXLAN-Inbound'
+    name: 'AllowIKE-Inbound'
     properties: {
       priority: 100
       direction: 'Inbound'
       access: 'Allow'
       protocol: 'Udp'
       sourcePortRange: '*'
-      destinationPortRange: '4789'
+      destinationPortRange: '500'
       sourceAddressPrefix: '10.200.0.0/24'
       destinationAddressPrefix: '*'
-      description: 'Allow VXLAN (UDP 4789) from dest VNet'
+      description: 'Allow IKE (UDP 500) from dest VNet'
+    }
+  }
+  {
+    name: 'AllowNATT-Inbound'
+    properties: {
+      priority: 101
+      direction: 'Inbound'
+      access: 'Allow'
+      protocol: 'Udp'
+      sourcePortRange: '*'
+      destinationPortRange: '4500'
+      sourceAddressPrefix: '10.200.0.0/24'
+      destinationAddressPrefix: '*'
+      description: 'Allow IPsec NAT-T (UDP 4500) from dest VNet'
+    }
+  }
+  {
+    name: 'AllowESP-Inbound'
+    properties: {
+      priority: 102
+      direction: 'Inbound'
+      access: 'Allow'
+      protocol: '*'
+      sourcePortRange: '*'
+      destinationPortRange: '*'
+      sourceAddressPrefix: '10.200.0.0/24'
+      destinationAddressPrefix: '*'
+      description: 'Allow ESP (protocol 50) from dest VNet'
     }
   }
   {
@@ -68,22 +96,82 @@ var routerNsgRules = [
       description: 'Allow SSH from Bastion subnet'
     }
   }
+  {
+    name: 'AllowForwardedTraffic-Inbound'
+    properties: {
+      priority: 200
+      direction: 'Inbound'
+      access: 'Allow'
+      protocol: '*'
+      sourcePortRange: '*'
+      destinationPortRange: '*'
+      sourceAddressPrefix: '10.100.0.0/26'
+      destinationAddressPrefix: '*'
+      description: 'Allow UDR-forwarded traffic from W365 subnet (FloatingIP preserves original dst)'
+    }
+  }
+]
+
+// NSG rules for W365 subnet — allow outbound to VTI overlay addresses
+var w365NsgRules = [
+  {
+    name: 'AllowVtiOverlay-Outbound'
+    properties: {
+      priority: 100
+      direction: 'Outbound'
+      access: 'Allow'
+      protocol: '*'
+      sourcePortRange: '*'
+      destinationPortRange: '*'
+      sourceAddressPrefix: '10.100.0.0/26'
+      destinationAddressPrefix: '172.16.0.0/28'
+      description: 'Allow outbound to VTI overlay addresses (not in VirtualNetwork service tag)'
+    }
+  }
 ]
 
 // NSG rules for destination NVA subnet
 var destNvaNsgRules = [
   {
-    name: 'AllowVXLAN-Inbound'
+    name: 'AllowIKE-Inbound'
     properties: {
       priority: 100
       direction: 'Inbound'
       access: 'Allow'
       protocol: 'Udp'
       sourcePortRange: '*'
-      destinationPortRange: '4789'
+      destinationPortRange: '500'
       sourceAddressPrefix: '10.100.0.0/24'
       destinationAddressPrefix: '*'
-      description: 'Allow VXLAN (UDP 4789) from source VNet'
+      description: 'Allow IKE (UDP 500) from source VNet'
+    }
+  }
+  {
+    name: 'AllowNATT-Inbound'
+    properties: {
+      priority: 101
+      direction: 'Inbound'
+      access: 'Allow'
+      protocol: 'Udp'
+      sourcePortRange: '*'
+      destinationPortRange: '4500'
+      sourceAddressPrefix: '10.100.0.0/24'
+      destinationAddressPrefix: '*'
+      description: 'Allow IPsec NAT-T (UDP 4500) from source VNet'
+    }
+  }
+  {
+    name: 'AllowESP-Inbound'
+    properties: {
+      priority: 102
+      direction: 'Inbound'
+      access: 'Allow'
+      protocol: '*'
+      sourcePortRange: '*'
+      destinationPortRange: '*'
+      sourceAddressPrefix: '10.100.0.0/24'
+      destinationAddressPrefix: '*'
+      description: 'Allow ESP (protocol 50) from source VNet'
     }
   }
   {
@@ -141,6 +229,7 @@ module sourceVnet 'modules/vnet.bicep' = {
         name: 'snet-w365'
         addressPrefix: '10.100.0.0/26'
         routeTableId: udrW365.id
+        nsgRules: w365NsgRules
       }
       {
         name: 'snet-router'
@@ -181,7 +270,7 @@ module destVnet 'modules/vnet.bicep' = {
 }
 
 // ============================================================
-// VNet Peering (required for VXLAN — Azure blocks GRE over public IPs)
+// VNet Peering (required for IPsec between VNets)
 // ============================================================
 
 resource peeringSourceToDest 'Microsoft.Network/virtualNetworks/virtualNetworkPeerings@2024-05-01' = {
@@ -224,7 +313,7 @@ module ilb 'modules/internal-lb.bicep' = {
 }
 
 // ============================================================
-// Source-side Linux routers (VXLAN + SNAT)
+// Source-side Linux routers (IPsec VTI + SNAT)
 // ============================================================
 
 module router1 'modules/linux-nva.bicep' = {
@@ -333,7 +422,7 @@ output ilbFrontendIp string = ilb.outputs.frontendIp
 
 output postDeploymentInstructions string = '''
 === Post-Deployment Steps ===
-VXLAN tunnels over VNet peering (Azure blocks GRE between VMs).
+IPsec VTI tunnels over VNet peering (IKEv2 + ESP via strongSwan).
 Use private IPs from the outputs below.
 
 1. SSH to Router-1 via Bastion and run:
@@ -347,5 +436,5 @@ Use private IPs from the outputs below.
 
 4. Verify tunnels: ping 172.16.0.2 from Router-1, ping 172.16.0.6 from Router-2
 
-5. Test end-to-end: RDP to test VM via Bastion, verify traffic flows through ILB -> Router -> VXLAN -> NVA
+5. Test end-to-end: RDP to test VM via Bastion, verify traffic flows through ILB -> Router -> IPsec -> NVA
 '''
