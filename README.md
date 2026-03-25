@@ -4,6 +4,34 @@ Deployable Bicep lab that provisions the infrastructure described in the [Micros
 
 > **Why strongSwan IPsec?** Azure does not support GRE (IP protocol 47) — the hypervisor vSwitch drops it in all directions. This lab uses IPsec (IKEv2 + ESP) with route-based VTI interfaces, matching the exact tunnel protocol used in production Zscaler deployments on Azure.
 
+## Table of Contents
+
+- [Lab Topology](#lab-topology)
+- [Prerequisites](#prerequisites)
+- [Deployment](#deployment)
+  - [1. Clone the repo](#1-clone-the-repo)
+  - [2. Create a resource group](#2-create-a-resource-group)
+  - [3. Deploy](#3-deploy)
+  - [4. Post-deployment: Configure IPsec tunnels](#4-post-deployment-configure-ipsec-tunnels)
+- [Testing](#testing)
+  - [Test 1 — HTTPS through IPsec tunnel 1](#test-1--https-through-ipsec-tunnel-1)
+  - [Test 2 — HTTPS through IPsec tunnel 2](#test-2--https-through-ipsec-tunnel-2)
+  - [Test 3 — End-to-end HTTPS](#test-3--end-to-end-https-test-vm--ilb--router--ipsec--nva)
+  - [Test 4 — Packet capture](#test-4--verify-traffic-traverses-ipsec-packet-capture)
+  - [Test 5 — NVA access log](#test-5--verify-via-nva-access-log)
+  - [Test 6 — IPsec + VTI status](#test-6--verify-ipsec-tunnel-status-and-vti-counters)
+  - [Test 7 — M365 force-tunnel](#test-7--m365-traffic-path-force-tunnel-behavior)
+  - [Test summary](#test-summary)
+- [Architecture Reference](#architecture-reference)
+- [Production Reference: IPsec Tunnel & Route-Map Configuration](#production-reference-ipsec-tunnel--route-map-configuration)
+  - [IPsec Tunnel Configuration](#ipsec-tunnel-configuration-ikev2--vti)
+  - [SNAT Configuration](#snat-configuration)
+  - [Route-Map: M365 Optimize Breakout](#route-map-m365-optimize-breakout)
+  - [Multi-NVA Scaling](#multi-nva-scaling)
+  - [Microsoft 365 Subnet UDR](#microsoft-365-subnet-udr)
+  - [Lab ↔ Production Mapping](#lab--production-mapping)
+- [Clean Up](#clean-up)
+
 ---
 
 ## Lab Topology
@@ -118,61 +146,75 @@ az vm run-command invoke \
 
 ## Testing
 
-After configuring the IPsec tunnels, run the following tests to validate HTTPS traffic through the full path and verify it traverses the IPsec tunnel.
-
-The NVA runs nginx with a self-signed TLS certificate (installed via cloud-init), serving an HTTPS health endpoint that simulates Zscaler web inspection.
+The NVA runs nginx with a self-signed TLS certificate (installed via cloud-init), serving an HTTPS health endpoint that simulates Zscaler web inspection. All tests use `az vm run-command invoke` — no Bastion or SSH required.
 
 ### Test 1 — HTTPS through IPsec tunnel 1
 
-SSH to **Router-1** via Bastion:
 ```bash
-curl -sk -o /dev/null -w 'Status: %{http_code}, Time: %{time_total}s\n' https://172.16.0.2/health
-curl -sk https://172.16.0.2/health
+az vm run-command invoke \
+  --resource-group rg-w365-zscaler-lab \
+  --name router-1 \
+  --command-id RunShellScript \
+  --scripts "curl -sk https://172.16.0.2/health" \
+  --query 'value[0].message' -o tsv
 ```
-**Expected:** `Status: 200`, response `OK`. Confirms HTTPS (TCP 443) works end-to-end through IPsec tunnel 1 (VTI key 1).
+
+**Expected:** `OK`. Confirms HTTPS works end-to-end through IPsec tunnel 1 (VTI key 1).
 
 ### Test 2 — HTTPS through IPsec tunnel 2
 
-SSH to **Router-2** via Bastion:
 ```bash
-curl -sk -o /dev/null -w 'Status: %{http_code}, Time: %{time_total}s\n' https://172.16.0.6/health
-curl -sk https://172.16.0.6/health
+az vm run-command invoke \
+  --resource-group rg-w365-zscaler-lab \
+  --name router-2 \
+  --command-id RunShellScript \
+  --scripts "curl -sk https://172.16.0.6/health" \
+  --query 'value[0].message' -o tsv
 ```
-**Expected:** `Status: 200`, response `OK`. Confirms HTTPS through IPsec tunnel 2 (VTI key 2).
+
+**Expected:** `OK`. Confirms HTTPS through IPsec tunnel 2 (VTI key 2).
 
 ### Test 3 — End-to-end HTTPS: Test VM → ILB → Router → IPsec → NVA
 
-RDP to the **Test VM** via Bastion. Open PowerShell:
-```powershell
-# Bypass self-signed cert validation
-[Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
-$web = New-Object Net.WebClient
-$web.DownloadString('https://172.16.0.2/health')
+```bash
+az vm run-command invoke \
+  --resource-group rg-w365-zscaler-lab \
+  --name vm-w365-test \
+  --command-id RunPowerShellScript \
+  --scripts "curl.exe -sk https://172.16.0.2/health" \
+  --query 'value[0].message' -o tsv
 ```
-**Expected:** Returns `OK`. This proves the complete HTTPS path:
+
+**Expected:** `OK`. This proves the complete HTTPS path:
 
 ```
 Test VM (10.100.0.4)
     → UDR (0.0.0.0/0 → 10.100.0.68)
     → ILB (HA Ports, Floating IP preserves original dest)
-    → Router-1 (SNAT + IPsec encap)
+    → Router-1 or Router-2 (SNAT + IPsec encap)
     → VNet peering (private IP underlay)
     → Linux NVA nginx (IPsec decap → TLS termination at 172.16.0.2:443)
 ```
 
-> **Key config:** Floating IP (`enableFloatingIP: true`) must be enabled on the ILB HA Ports rule so the original destination IP (172.16.0.2) is preserved when forwarded to the router. Without it, the ILB rewrites the destination to the backend IP and the router can't make a forwarding decision. The W365 and router subnet NSGs also need explicit rules allowing traffic to VTI overlay addresses (172.16.0.0/28), since these private IPs are outside the `VirtualNetwork` service tag.
+> **Why `172.16.0.2`?** Traffic to `10.200.0.4` takes the VNet peering system route, bypassing the ILB and IPsec. `172.16.0.2` has no system route, so it hits the UDR `0.0.0.0/0 → ILB` and proves the full tunnel path.
+
+> **Key config:** FloatingIP must be enabled on the ILB so the original dest IP (`172.16.0.2`) is preserved. NSGs on the W365 and router subnets need explicit allow rules for `172.16.0.0/28` — these VTI addresses are outside the `VirtualNetwork` service tag.
 
 ### Test 4 — Verify traffic traverses IPsec (packet capture)
 
-This is the key proof that HTTPS is encapsulated inside ESP, not routed via Azure's SDN.
+This proves HTTPS traffic is encrypted inside the IPsec tunnel, not sent in the clear over Azure networking.
 
 > **Note:** The lab uses `forceencaps=yes` (NAT-T), so ESP is wrapped inside UDP port 4500. Use `udp port 4500` as the tcpdump filter — a raw `esp` filter will not match.
 
-SSH to **Router-1** via Bastion:
 ```bash
-# Start tcpdump on eth0 (underlay) while curling NVA over the overlay
-sudo bash -c 'timeout 8 tcpdump -i eth0 udp port 4500 -nn -c 10 > /tmp/cap.txt 2>&1 &
-sleep 1; curl -sk https://172.16.0.2/health; sleep 5; cat /tmp/cap.txt'
+az vm run-command invoke \
+  --resource-group rg-w365-zscaler-lab \
+  --name router-1 \
+  --command-id RunShellScript \
+  --scripts "bash -c 'timeout 8 tcpdump -i eth0 udp port 4500 -nn -c 10 \
+    > /tmp/cap.txt 2>&1 & sleep 1; curl -sk https://172.16.0.2/health; \
+    sleep 5; cat /tmp/cap.txt'" \
+  --query 'value[0].message' -o tsv
 ```
 
 **Expected output** (HTTPS packets wrapped in ESP-in-UDP):
@@ -187,9 +229,13 @@ The ESP-in-UDP packets prove:
 
 ### Test 5 — Verify via NVA access log
 
-SSH to **Linux NVA** via Bastion:
 ```bash
-tail -10 /var/log/nginx/access.log
+az vm run-command invoke \
+  --resource-group rg-w365-zscaler-lab \
+  --name linux-nva \
+  --command-id RunShellScript \
+  --scripts "tail -10 /var/log/nginx/access.log" \
+  --query 'value[0].message' -o tsv
 ```
 
 **Expected:** Log entries showing requests from overlay IPs:
@@ -203,16 +249,51 @@ Source `172.16.0.1` = Router-1 (after SNAT), `172.16.0.5` = Router-2. This confi
 ### Test 6 — Verify IPsec tunnel status and VTI counters
 
 ```bash
-ipsec statusall                   # Show SA status (ESTABLISHED = healthy)
-ip -s link show vti1              # RX/TX byte and packet counts
-ip -s link show vti2              # Should show non-zero counters after tests
+az vm run-command invoke \
+  --resource-group rg-w365-zscaler-lab \
+  --name linux-nva \
+  --command-id RunShellScript \
+  --scripts "echo '=== IKE SAs ==='; ipsec status | grep ESTABLISHED; echo; \
+    echo '=== ESP SAs ==='; ipsec status | grep INSTALLED; echo; \
+    echo '=== vti1 (peer router-1) ==='; ip -s link show vti1 | grep -E 'state|peer|RX:|TX:' -A1; echo; \
+    echo '=== vti2 (peer router-2) ==='; ip -s link show vti2 | grep -E 'state|peer|RX:|TX:' -A1" \
+  --query "value[0].message" --output tsv
 ```
+
+**Expected output:**
+```
+=== IKE SAs ===
+tunnel1[...]: ESTABLISHED ... 10.200.0.4...10.100.0.69
+tunnel2[...]: ESTABLISHED ... 10.200.0.4...10.100.0.70
+
+=== ESP SAs ===
+tunnel1{...}: INSTALLED, TUNNEL, reqid 1, ESP in UDP SPIs: ...
+tunnel2{...}: INSTALLED, TUNNEL, reqid 2, ESP in UDP SPIs: ...
+
+=== vti1 (peer router-1) ===
+vti1@NONE: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1400 ... state UNKNOWN
+    link/ipip 10.200.0.4 peer 10.100.0.69
+    RX:  bytes packets ...
+         13027     109  ...
+    TX:  bytes packets ...
+         33827     112  ...
+
+=== vti2 (peer router-2) ===
+vti2@NONE: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1400 ... state UNKNOWN
+    link/ipip 10.200.0.4 peer 10.100.0.70
+    RX:  bytes packets ...
+          5256      43  ...
+    TX:  bytes packets ...
+         10700      35  ...
+```
+
+Both IKE SAs should show `ESTABLISHED`, both ESP SAs `INSTALLED`, and VTI RX/TX byte counts should be non-zero.
 
 ### Test 7 — M365 traffic path (force-tunnel behavior)
 
-The UDR sends `0.0.0.0/0` to the ILB, meaning **all traffic** from the Microsoft 365 subnet — including M365 — is force-tunneled through the routers. This matches the Zscaler ZIA deployment model.
+The UDR sends `0.0.0.0/0` to the ILB, meaning **all traffic** from the W365 subnet — including M365 — is force-tunneled through the routers. This matches the Zscaler ZIA deployment model.
 
-From the **Test VM** via Bastion:
+This test requires RDP to the **Test VM** via Bastion. Open a command prompt:
 ```
 tracert -h 5 -d outlook.office365.com
 ```
@@ -225,55 +306,13 @@ tracert -h 5 -d outlook.office365.com
 
 | # | Test | From | Command | Expected |
 |---|---|---|---|---|
-| 1 | HTTPS tunnel 1 | Router-1 | `curl -sk https://172.16.0.2/health` | `OK` (HTTP 200) |
-| 2 | HTTPS tunnel 2 | Router-2 | `curl -sk https://172.16.0.6/health` | `OK` (HTTP 200) |
-| 3 | HTTPS end-to-end | Test VM | PowerShell WebClient to `172.16.0.2` | `OK` (HTTP 200) |
-| 4 | Packet capture | Router-1 | `tcpdump -i eth0 udp port 4500` | ESP-in-UDP encapsulated traffic |
-| 5 | NVA access log | NVA | `tail /var/log/nginx/access.log` | Requests from `172.16.0.1`/`.5` |
-| 6 | IPsec + VTI status | NVA | `ipsec statusall` + `ip -s link show vti1` | ESTABLISHED SAs, non-zero RX/TX |
-| 7 | M365 force-tunnel | Test VM | `tracert outlook.office365.com` | First hop = router IP |
-
-### Running tests via Azure CLI (without Bastion)
-
-```bash
-# HTTPS from Router-1 through IPsec
-az vm run-command invoke \
-  --resource-group rg-w365-zscaler-lab \
-  --name router-1 \
-  --command-id RunShellScript \
-  --scripts "curl -sk https://172.16.0.2/health"
-
-# HTTPS from Router-2 through IPsec
-az vm run-command invoke \
-  --resource-group rg-w365-zscaler-lab \
-  --name router-2 \
-  --command-id RunShellScript \
-  --scripts "curl -sk https://172.16.0.6/health"
-
-# Packet capture proof (ESP-in-UDP encapsulation via NAT-T)
-az vm run-command invoke \
-  --resource-group rg-w365-zscaler-lab \
-  --name router-1 \
-  --command-id RunShellScript \
-  --scripts "bash -c 'timeout 8 tcpdump -i eth0 udp port 4500 -nn -c 10 \
-    > /tmp/cap.txt 2>&1 & sleep 1; curl -sk https://172.16.0.2/health; \
-    sleep 5; cat /tmp/cap.txt'"
-
-# NVA access log verification
-az vm run-command invoke \
-  --resource-group rg-w365-zscaler-lab \
-  --name linux-nva \
-  --command-id RunShellScript \
-  --scripts "tail -10 /var/log/nginx/access.log"
-
-# End-to-end HTTPS from Test VM (Windows)
-az vm run-command invoke \
-  --resource-group rg-w365-zscaler-lab \
-  --name vm-w365-test \
-  --command-id RunPowerShellScript \
-  --scripts "[Net.ServicePointManager]::ServerCertificateValidationCallback = {\$true}; \
-    (New-Object Net.WebClient).DownloadString('https://172.16.0.2/health')"
-```
+| 1 | HTTPS tunnel 1 | router-1 | `curl -sk https://172.16.0.2/health` | `OK` (HTTP 200) |
+| 2 | HTTPS tunnel 2 | router-2 | `curl -sk https://172.16.0.6/health` | `OK` (HTTP 200) |
+| 3 | HTTPS end-to-end | vm-w365-test | `curl.exe -sk https://172.16.0.2/health` | `OK` (HTTP 200) |
+| 4 | Packet capture | router-1 | `tcpdump -i eth0 udp port 4500` | ESP-in-UDP encapsulated traffic |
+| 5 | NVA access log | linux-nva | `tail /var/log/nginx/access.log` | Requests from `172.16.0.1`/`.5` |
+| 6 | IPsec + VTI status | linux-nva | `ipsec statusall` + `ip -s link show vti1` | ESTABLISHED SAs, non-zero RX/TX |
+| 7 | M365 force-tunnel | vm-w365-test (Bastion RDP) | `tracert outlook.office365.com` | First hop = router IP |
 
 ---
 
